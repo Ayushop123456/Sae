@@ -1,108 +1,224 @@
-const http = require("http");
+const express = require("express");
 
+const app = express();
 const PORT = process.env.PORT || 3000;
-const API_KEY = process.env.API_KEY || "EggChanBruh";
+const API_KEY = "EggChanBruh"
 
-let latest = {
-    source: "roblox",
-    updatedAt: null,
-    totalEggs: 0,
-    biomes: []
-};
+app.use(express.json({ limit: "1mb" }));
 
-function sendJSON(res, status, data) {
-    const body = JSON.stringify(data);
+// uid -> egg
+const eggs = new Map();
 
-    res.writeHead(status, {
-        "Content-Type": "application/json",
-        "Content-Length": Buffer.byteLength(body)
-    });
-
-    res.end(body);
+function authenticated(req) {
+    const auth = req.headers.authorization || "";
+    return API_KEY && auth === `Bearer ${API_KEY}`;
 }
 
-const server = http.createServer((req, res) => {
+function cleanString(value, fallback = "") {
+    return typeof value === "string" ? value : fallback;
+}
 
-    // =========================
-    // GET /eggs
-    // =========================
-    if (req.method === "GET" && req.url === "/eggs") {
-        return sendJSON(res, 200, latest);
+function normalizeEgg(raw) {
+    if (!raw || typeof raw !== "object") return null;
+
+    const uid = cleanString(raw.uid).trim();
+    if (!uid || uid.length > 200) return null;
+
+    const now = Date.now();
+
+    return {
+        uid,
+        areaId: cleanString(raw.areaId),
+        biome: cleanString(raw.biome || raw.areaId),
+        assetCategory: cleanString(raw.assetCategory),
+        pet: cleanString(raw.pet, "Unknown"),
+        rarity: cleanString(raw.rarity, "Unknown"),
+        mutation: raw.mutation == null || raw.mutation === ""
+            ? "None"
+            : cleanString(raw.mutation, "None"),
+        baseMutation: raw.baseMutation == null || raw.baseMutation === ""
+            ? "None"
+            : cleanString(raw.baseMutation, "None"),
+        firstSeen: Number.isFinite(Number(raw.firstSeen))
+            ? Number(raw.firstSeen)
+            : now,
+        lastSeen: Number.isFinite(Number(raw.lastSeen))
+            ? Number(raw.lastSeen)
+            : now
+    };
+}
+
+/*
+    Scanner -> server
+
+    This is the only write endpoint.
+*/
+app.post("/api/eggs", (req, res) => {
+    if (!authenticated(req)) {
+        return res.status(401).json({
+            error: "Unauthorized"
+        });
     }
 
-    // =========================
-    // POST /eggs
-    // =========================
-    if (req.method === "POST" && req.url === "/eggs") {
+    const body = req.body;
 
-        if (req.headers["x-api-key"] !== API_KEY) {
-            return sendJSON(res, 401, {
-                ok: false,
-                error: "Unauthorized"
-            });
+    // Accept either:
+    // { egg: {...} }
+    // or
+    // { eggs: [{...}, {...}] }
+    // or directly { uid: "...", ... }
+    let incoming;
+
+    if (Array.isArray(body.eggs)) {
+        incoming = body.eggs;
+    } else if (body.egg) {
+        incoming = [body.egg];
+    } else {
+        incoming = [body];
+    }
+
+    let updated = 0;
+    let removed = 0;
+
+    for (const raw of incoming) {
+        // Optional removal notification
+        if (raw && raw.removed === true) {
+            const uid = cleanString(raw.uid).trim();
+
+            if (uid && eggs.delete(uid)) {
+                removed++;
+            }
+
+            continue;
         }
 
-        let body = "";
+        const egg = normalizeEgg(raw);
 
-        req.on("data", chunk => {
-            body += chunk;
+        if (!egg) continue;
 
-            // Prevent huge requests
-            if (body.length > 2 * 1024 * 1024) {
-                req.destroy();
-            }
-        });
+        const old = eggs.get(egg.uid);
 
-        req.on("end", () => {
-            try {
-                const data = JSON.parse(body);
+        // Preserve original firstSeen.
+        if (old && Number.isFinite(old.firstSeen)) {
+            egg.firstSeen = old.firstSeen;
+        }
 
-                // Must contain the live egg list
-                if (!data || !Array.isArray(data.biomes)) {
-                    return sendJSON(res, 400, {
-                        ok: false,
-                        error: "Invalid payload: biomes must be an array"
-                    });
-                }
+        egg.lastSeen = Date.now();
 
-                // Replace the old snapshot completely
-                latest = {
-                    source: "roblox",
-                    updatedAt: new Date().toISOString(),
-                    totalEggs: Number(data.totalEggs) || 0,
-                    biomes: data.biomes
-                };
-
-                console.log(
-                    `[EGGS] Updated: ${latest.totalEggs} live eggs`
-                );
-
-                return sendJSON(res, 200, {
-                    ok: true,
-                    totalEggs: latest.totalEggs,
-                    updatedAt: latest.updatedAt
-                });
-
-            } catch (err) {
-                return sendJSON(res, 400, {
-                    ok: false,
-                    error: "Invalid JSON"
-                });
-            }
-        });
-
-        return;
+        eggs.set(egg.uid, egg);
+        updated++;
     }
 
-    // =========================
-    // Everything else = 404
-    // =========================
-    return sendJSON(res, 404, {
-        ok: false,
-        error: "Not Found"
+    res.json({
+        ok: true,
+        updated,
+        removed,
+        totalEggs: eggs.size
     });
 });
 
-server.listen(PORT, () => {
-    console.log(`SAE Egg API running on port ${PORT}`);
+
+/*
+    ONLY public read endpoint.
+
+    GET /api/eggs
+    GET /api/eggs?rarity=Divine
+    GET /api/eggs?rarity=Divine,Eternal,Mythic
+    GET /api/eggs?biome=Jungle
+    GET /api/eggs?pet=Gorilla
+*/
+app.get("/api/eggs", (req, res) => {
+    const rarityFilter = req.query.rarity
+        ? req.query.rarity
+            .split(",")
+            .map(x => x.trim().toLowerCase())
+            .filter(Boolean)
+        : [];
+
+    const biomeFilter = req.query.biome
+        ? req.query.biome.trim().toLowerCase()
+        : "";
+
+    const petFilter = req.query.pet
+        ? req.query.pet.trim().toLowerCase()
+        : "";
+
+    const filtered = [];
+
+    for (const egg of eggs.values()) {
+        if (
+            rarityFilter.length &&
+            !rarityFilter.includes(egg.rarity.toLowerCase())
+        ) {
+            continue;
+        }
+
+        if (
+            biomeFilter &&
+            egg.biome.toLowerCase() !== biomeFilter
+        ) {
+            continue;
+        }
+
+        if (
+            petFilter &&
+            egg.pet.toLowerCase() !== petFilter
+        ) {
+            continue;
+        }
+
+        filtered.push(egg);
+    }
+
+    // Group by biome
+    const biomeMap = new Map();
+
+    for (const egg of filtered) {
+        const biome = egg.biome || "Unknown";
+
+        if (!biomeMap.has(biome)) {
+            biomeMap.set(biome, []);
+        }
+
+        biomeMap.get(biome).push({
+            uid: egg.uid,
+            rarity: egg.rarity,
+            pet: egg.pet,
+            mutation: egg.mutation,
+            baseMutation: egg.baseMutation,
+            areaId: egg.areaId,
+            assetCategory: egg.assetCategory,
+            firstSeen: egg.firstSeen,
+            lastSeen: egg.lastSeen
+        });
+    }
+
+    const biomes = [];
+
+    for (const [name, biomeEggs] of biomeMap) {
+        biomes.push({
+            name,
+            eggs: biomeEggs
+        });
+    }
+
+    res.json({
+        source: "roblox",
+        updatedAt: new Date().toISOString(),
+        totalEggs: filtered.length,
+        biomes
+    });
+});
+
+
+app.get("/health", (req, res) => {
+    res.json({
+        ok: true,
+        eggs: eggs.size
+    });
+});
+
+
+app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Server running on port ${PORT}`);
 });
